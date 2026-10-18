@@ -96,11 +96,10 @@ void Video::Reset() {
     m_NMIDelay = 0;
     m_genLatchDecayCycles = 0;
     m_bgTileCacheLine = 0xFFFF;
-    m_bgTileCacheT = 0xFFFF;
+    m_bgTileCacheV = 0xFFFF;
     m_bgTileCacheX = 0xFF;
     m_bgTileCachePatternTable = 0xFFFF;
-    m_bgTileCacheBaseLine = 0xFFFF;
-    m_scrollBaseLine = 0;
+    m_lineV = 0;
 
     memset(m_OAM, 0xFF, 256);
     m_secondaryOAMLength = 0;
@@ -154,7 +153,8 @@ u8 Video::ReadReg(u16 address, bool debug) {
     else if (address == PPUDATA) {
         u8 value = MemR(m_v);
         u8 increment = (m_regs[PPUCTRL & 0x07] & 0x04) == 0 ? 1 : 32;
-        m_v = (m_v + increment) & 0x3FFF;
+        m_v = (m_v + increment) & 0x7FFF;
+        OnCPUWriteV();
 
         m_genLatch = value;
         m_genLatchDecayCycles = 0;
@@ -213,17 +213,15 @@ void Video::WriteReg(u16 address, u8 value) {
         else { // Segunda escritura, lower byte
             m_t = (m_t & 0xFF00) | value;
             m_v = m_t;
-            u16 line = GetY();
-            bool renderingEnabled = (m_regs[PPUMASK & 0x07] & 0x18) != 0;
-            if (renderingEnabled && line < NES_SCREEN_H)
-                m_scrollBaseLine = line + 1;
+            OnCPUWriteV();
         }
         m_w = (m_w + 1) % 2;
     }
     else if (address == PPUDATA) {
         MemW(m_v, value);
         u8 increment = (m_regs[PPUCTRL & 0x07] & 0x04) == 0 ? 1 : 32;
-        m_v = (m_v + increment) & 0x3FFF;
+        m_v = (m_v + increment) & 0x7FFF;
+        OnCPUWriteV();
     }
     
     if (address != PPUSTATUS) {
@@ -255,11 +253,11 @@ void Video::Update(u16 cpuCycles) {
 
         ScanlineEvents(prevDot, dot, line);
 
-        if (dot >= NES_SCANLINE_PPU_CYCLES-1) {
-            if (ppuCycles > 0) {
-                m_cycles += 1;
-                ppuCycles -= 1;
-            }
+        // Only move to the next line if there are cycles left. Otherwise it will happen on the
+        // next call; resetting m_nextDot here would redraw the current line
+        if ((dot >= NES_SCANLINE_PPU_CYCLES-1) && (ppuCycles > 0)) {
+            m_cycles += 1;
+            ppuCycles -= 1;
             m_nextDot = 0;
             line = m_cycles / NES_SCANLINE_PPU_CYCLES;
             if (line == NES_SCREEN_H)
@@ -267,7 +265,6 @@ void Video::Update(u16 cpuCycles) {
             else if (line == 261) { // Pre-render line
                 // Clear Sprite Overflow, Sprite 0 Hit and VBlank
                 m_regs[PPUSTATUS & 0x07] = (m_regs[PPUSTATUS & 0x07] & 0x1F);
-                m_scrollBaseLine = 0;
             }
             else if (line == 262)
                 OnEndFrame();
@@ -280,20 +277,25 @@ void Video::ScanlineEvents(u16 prevDot, u16 dot, u16 line) {
     bool scanlineWithEvents = (line < 240) || (line == 261);
 
     if (renderingEnabled && scanlineWithEvents) {
+        // Events are processed in dot order so the result does not depend
+        // on how many cycles are executed at once
         for (int i = prevDot + 1; i <= dot; i++) {
             if (((i <= 256) || (i >= 328)) && (i % 8 == 0)) {
                 CoarseXIncrement(m_v);
             }
-        }
-        if ((prevDot < 256) && (dot >= 256)) {
-            FineYIncrement(m_v);
-        }
-        if ((prevDot < 257) && (dot >= 257)) {
-            m_v = (m_v & 0x7BE0) | (m_t & 0x041F);
-            m_OAMAddress = 0;
-        }
-        if ((line == 261) && (prevDot < 304) && (dot >= 280)) { // end of vblank
-            m_v = (m_v & 0x041F) | (m_t & 0x7BE0);
+            if (i == 256) {
+                FineYIncrement(m_v);
+            }
+            else if (i == 257) {
+                m_v = (m_v & 0x7BE0) | (m_t & 0x041F);
+                m_OAMAddress = 0;
+                // v now holds the start position of the next line
+                m_lineV = m_v;
+            }
+            else if ((line == 261) && (i >= 280) && (i <= 304)) { // end of vblank
+                m_v = (m_v & 0x041F) | (m_t & 0x7BE0);
+                m_lineV = m_v;
+            }
         }
 
         // Sprite evaluation for the NEXT scanline (happens during dots 65-256)
@@ -435,22 +437,18 @@ void Video::DrawPixels() {
 }
 
 void Video::BuildBGLineCache(u16 line, u16 patternTableAddress) {
-    if (m_bgTileCacheLine == line && m_bgTileCacheT == m_t && m_bgTileCacheX == m_x && m_bgTileCachePatternTable == patternTableAddress && m_bgTileCacheBaseLine == m_scrollBaseLine)
+    if (m_bgTileCacheLine == line && m_bgTileCacheV == m_lineV && m_bgTileCacheX == m_x && m_bgTileCachePatternTable == patternTableAddress)
         return;
 
     m_bgTileCacheLine = line;
-    m_bgTileCacheT = m_t;
+    m_bgTileCacheV = m_lineV;
     m_bgTileCacheX = m_x;
     m_bgTileCachePatternTable = patternTableAddress;
-    m_bgTileCacheBaseLine = m_scrollBaseLine;
 
-    u16 fetchAddress = m_t;
-    u16 lineOffset = (line >= m_scrollBaseLine) ? line - m_scrollBaseLine : line;
-    u16 fineY = (fetchAddress >> 12) & 0x07;
-    u16 coarseYSteps = (fineY + lineOffset) / 8;
-    fetchAddress = (fetchAddress & ~0x7000) | (((fineY + lineOffset) & 0x07) << 12);
-    for (u16 i = 0; i < coarseYSteps; i++)
-        CoarseYIncrement(fetchAddress);
+    // Use the value of v at the start of the line, like the real PPU does.
+    // This way mid-frame scroll changes ($2005/$2006) are honored,
+    // whether they are made with rendering enabled or disabled.
+    u16 fetchAddress = m_lineV;
 
     u16 fineXOffset = m_x;
     for (u16 i = 0; i < (fineXOffset / 8); i++)
@@ -800,6 +798,18 @@ void Video::CoarseXIncrement(u16& v) {
         v += 1;                 // increment coarse X
 }
 
+void Video::OnCPUWriteV() {
+    // If the PPU is not drawing the visible part of the line, the new value of v
+    // is used directly for the next line to be drawn. If it is in the middle
+    // of a line, the change is applied on the next line through dot 257.
+    bool renderingEnabled = (m_regs[PPUMASK & 0x07] & 0x18) != 0;
+    u16 line = GetY();
+    u16 dot = GetX();
+    bool fetchingLine = renderingEnabled && ((line < NES_SCREEN_H) || (line == 261)) && (dot < 257);
+    if (!fetchingLine)
+        m_lineV = m_v;
+}
+
 u32 Video::GetNumFrames() const {
     return m_numFrames;
 }
@@ -878,9 +888,10 @@ void Video::LoadState(istream *stream) {
     stream->read((char*)&m_VRAM[0], sizeof(u8) * 0x1000);
 
     m_secondaryOAMLine = 0xFFFF;
-    m_v &= 0x3FFF;
+    m_v &= 0x7FFF;
     m_t &= 0x7FFF;
-    m_scrollBaseLine = 0;
+    m_lineV = m_v;
+    m_bgTileCacheLine = 0xFFFF;
     m_x &= 0x07;
     m_w &= 0x01;
 }

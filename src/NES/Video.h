@@ -115,11 +115,10 @@ namespace Nes {
         u8 m_NMIDelay;
         BGTileCache m_bgTileCache[33];
         u16 m_bgTileCacheLine;
-        u16 m_bgTileCacheT;
+        u16 m_bgTileCacheV;
         u8  m_bgTileCacheX;
         u16 m_bgTileCachePatternTable;
-        u16 m_bgTileCacheBaseLine;
-        u16 m_scrollBaseLine;
+        u16 m_lineV; // Value of v at the start of the line being drawn
 
         // PPU internal registers
         // https://wiki.nesdev.com/w/index.php?title=PPU_scrolling
@@ -146,6 +145,7 @@ namespace Nes {
         void CoarseXIncrement(u16& v);
         void CoarseYIncrement(u16& v);
         void FineYIncrement(u16& v);
+        void OnCPUWriteV();
         void ScanlineEvents(u16 prevDot, u16 dot, u16 line);
     };
 }
